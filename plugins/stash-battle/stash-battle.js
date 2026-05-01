@@ -483,43 +483,54 @@
     return { scenes, count };
   }
 
-  // Update a scene's rating and reposition it in the sorted array to keep ranks accurate
-  function repositionSceneInArray(arr, sceneId, newRating) {
+  // Update a scene's rating, stats, and record, then reposition it in the
+  // sorted array to keep ranks accurate.
+  function repositionSceneInArray(arr, sceneId, newRating, newStats, newRecord) {
     const idx = arr.findIndex(s => s.id === sceneId);
     if (idx === -1) return false;
-    
+
     const scene = arr[idx];
     scene.rating100 = newRating;
-    
+    if (newStats || newRecord) {
+      scene.custom_fields = scene.custom_fields || {};
+      if (newStats) scene.custom_fields[BATTLE_STATS_FIELD] = JSON.stringify(newStats);
+      if (newRecord) scene.custom_fields[BATTLE_RECORD_FIELD] = JSON.stringify(newRecord);
+    }
+
     // Remove from current position
     arr.splice(idx, 1);
-    
+
     // Find correct position (array is sorted by rating DESC)
     const newIdx = arr.findIndex(s => (s.rating100 || 0) < newRating);
-    
+
     // Insert at correct position
     if (newIdx === -1) {
       arr.push(scene); // Lowest rated, goes at end
     } else {
       arr.splice(newIdx, 0, scene);
     }
-    
+
     return true;
   }
 
-  // Update a scene's rating in the memory cache (keeps cache in sync after rating changes)
-  function updateSceneInCache(sceneId, newRating) {
-    // Reposition in allScenes (keeps rankings accurate, scene stays for opponent pool)
+  // Update a scene in the memory cache (rating + optional stats/record) so
+  // subsequent reads in this session see the new values without a refetch.
+  function updateSceneInCache(sceneId, newRating, newStats, newRecord) {
     if (memoryCache.allScenes) {
-      repositionSceneInArray(memoryCache.allScenes, sceneId, newRating);
+      repositionSceneInArray(memoryCache.allScenes, sceneId, newRating, newStats, newRecord);
       console.log(`[Stash Battle] 📝 Updated scene ${sceneId} rating to ${newRating} in memory cache`);
     }
-    
+
     // Also update in filteredScenes if present (but don't remove - that's done separately)
     if (memoryCache.filteredScenes) {
       const scene = memoryCache.filteredScenes.find(s => s.id === sceneId);
       if (scene) {
         scene.rating100 = newRating;
+        if (newStats || newRecord) {
+          scene.custom_fields = scene.custom_fields || {};
+          if (newStats) scene.custom_fields[BATTLE_STATS_FIELD] = JSON.stringify(newStats);
+          if (newRecord) scene.custom_fields[BATTLE_RECORD_FIELD] = JSON.stringify(newRecord);
+        }
       }
     }
   }
@@ -607,6 +618,7 @@
     date
     rating100
     play_count
+    custom_fields
     paths {
       screenshot
       preview
@@ -1474,8 +1486,16 @@
     }
   }
   
-  // Update scene rating in Stash database
-  async function updateSceneRating(sceneId, rating100) {
+  // Update scene rating + battle stats + battle record in Stash.
+  // stats/record may be omitted (placement-only writes) — in that case the
+  // custom_fields are left untouched.
+  async function updateSceneAfterMatch(sceneId, rating100, stats, record) {
+    const finalRating = Math.max(1, Math.min(100, rating100));
+    const fields = {};
+    if (stats) fields[BATTLE_STATS_FIELD] = JSON.stringify(stats);
+    if (record) fields[BATTLE_RECORD_FIELD] = JSON.stringify(record);
+    const hasFields = Object.keys(fields).length > 0;
+
     const mutation = `
       mutation SceneUpdate($input: SceneUpdateInput!) {
         sceneUpdate(input: $input) {
@@ -1484,25 +1504,23 @@
         }
       }
     `;
-    
-    const finalRating = Math.max(1, Math.min(100, rating100));
-    
-    try {
-      await graphqlQuery(mutation, {
-        input: {
-          id: sceneId,
-          rating100: finalRating
-        }
-      });
-      console.log(`[Stash Battle] 📝 Updated scene ${sceneId} rating to ${finalRating} in Stash`);
+    const input = { id: sceneId, rating100: finalRating };
+    if (hasFields) input.custom_fields = { partial: fields };
 
-      
-      // Update the in-memory cache to keep it in sync
-      updateSceneInCache(sceneId, finalRating);
-      
+    try {
+      await graphqlQuery(mutation, { input });
+      console.log(`[Stash Battle] 📝 Updated scene ${sceneId} → rating ${finalRating}${hasFields ? " (+ battle_stats/record)" : ""}`);
+      updateSceneInCache(sceneId, finalRating, stats, record);
     } catch (e) {
-      console.error(`[Stash Battle] Failed to update scene ${sceneId} rating:`, e);
+      console.error(`[Stash Battle] Failed to update scene ${sceneId}:`, e);
     }
+  }
+
+  // Backwards-compatible wrapper for paths that only need to set the rating
+  // (e.g. Gauntlet placement steps where stats already advanced via the
+  // earlier handleComparison call).
+  function updateSceneRating(sceneId, rating100) {
+    return updateSceneAfterMatch(sceneId, rating100, null, null);
   }
 
   // Remove a scene from the filtered pool (called after battle regardless of rating change)
@@ -1530,74 +1548,253 @@
   }
 
   // ============================================
-  // RATING LOGIC
+  // RATING LOGIC — Elo on the 1..100 rating100 scale
   // ============================================
 
-  // Dynamic K-factor based on play_count (similar to chess ELO for new vs established players)
-  // Scenes with more plays have more "established" ratings and change more slowly
-  function getKFactor(playCount) {
-    const count = playCount || 0;   // Handle null/undefined
-    if (count < 3) return 12;       // New: volatile, find true rating fast
-    if (count < 8) return 8;        // Settling: moderate changes
-    if (count < 15) return 6;       // Established: smaller changes
-    return 4;                       // Very established: stable rating
+  const BATTLE_STATS_FIELD = "battle_stats";
+  const BATTLE_RECORD_FIELD = "battle_record";
+  const BATTLE_RECORD_MAX = 30;
+
+  function emptyBattleStats() {
+    return {
+      total_matches: 0,
+      wins: 0,
+      losses: 0,
+      draws: 0,
+      current_streak: 0,
+      best_streak: 0,
+      worst_streak: 0,
+      last_match: null
+    };
   }
 
-  function handleComparison(winnerId, loserId, winnerCurrentRating, loserCurrentRating, winnerPlayCount = 0, loserPlayCount = 0, loserRank = null) {
-    const winnerRating = winnerCurrentRating || 1;
-    const loserRating = loserCurrentRating || 1;
-    
-    const ratingDiff = loserRating - winnerRating;
-    const expectedWinner = 1 / (1 + Math.pow(10, ratingDiff / 40));
-    
-    let winnerGain = 0, loserLoss = 0;
-    
-    console.log(`[Stash Battle] 📊 ELO Input: mode=${currentMode} winner=${winnerId}(raw=${winnerCurrentRating}, used=${winnerRating}, plays=${winnerPlayCount}) loser=${loserId}(raw=${loserCurrentRating}, used=${loserRating}, plays=${loserPlayCount}) loserRank=${loserRank}`);
-    console.log(`[Stash Battle] 📊 ELO Math: ratingDiff=${ratingDiff} expectedWinner=${expectedWinner.toFixed(4)}`);
+  function parseBattleStats(scene) {
+    const empty = emptyBattleStats();
+    const cf = scene && scene.custom_fields;
+    if (!cf) return empty;
+    const raw = cf[BATTLE_STATS_FIELD];
+    if (!raw) return empty;
+    try {
+      const obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+      return Object.assign(empty, obj);
+    } catch (e) {
+      console.warn(`[Stash Battle] Failed to parse ${BATTLE_STATS_FIELD} for scene ${scene.id}`);
+      return empty;
+    }
+  }
 
+  function parseBattleRecord(scene) {
+    const cf = scene && scene.custom_fields;
+    if (!cf) return [];
+    const raw = cf[BATTLE_RECORD_FIELD];
+    if (!raw) return [];
+    try {
+      const arr = typeof raw === "string" ? JSON.parse(raw) : raw;
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) {
+      console.warn(`[Stash Battle] Failed to parse ${BATTLE_RECORD_FIELD} for scene ${scene.id}`);
+      return [];
+    }
+  }
+
+  // Update summary stats. won === true | false | null (null = draw / no result).
+  function nextBattleStats(stats, won) {
+    const next = Object.assign({}, stats);
+    next.total_matches = (stats.total_matches || 0) + 1;
+    next.last_match = new Date().toISOString();
+    if (won === null) {
+      next.draws = (stats.draws || 0) + 1;
+      return next;
+    }
+    if (won) {
+      next.wins = (stats.wins || 0) + 1;
+      next.current_streak = (stats.current_streak || 0) >= 0 ? (stats.current_streak || 0) + 1 : 1;
+    } else {
+      next.losses = (stats.losses || 0) + 1;
+      next.current_streak = (stats.current_streak || 0) <= 0 ? (stats.current_streak || 0) - 1 : -1;
+    }
+    next.best_streak = Math.max(stats.best_streak || 0, next.current_streak);
+    next.worst_streak = Math.min(stats.worst_streak || 0, next.current_streak);
+    return next;
+  }
+
+  // Append a match entry, capped to BATTLE_RECORD_MAX most-recent entries.
+  function nextBattleRecord(history, opponentId, opponentTitle, won, ratingAfter) {
+    const safeTitle = (opponentTitle || "Unknown").replace(/:/g, " ");
+    const entry = {
+      date: new Date().toISOString(),
+      opponent: `${opponentId}:${safeTitle}`,
+      won: won,
+      ratingAfter: ratingAfter
+    };
+    const next = history.concat([entry]);
+    return next.length > BATTLE_RECORD_MAX ? next.slice(-BATTLE_RECORD_MAX) : next;
+  }
+
+  // Standard Elo expected-score using the chess divisor of 400.
+  // On a 1..100 scale this flattens the curve heavily; the K-factor and
+  // modifier stack do the work of producing meaningful rating changes.
+  function expectedScore(rating, opponentRating) {
+    return 1 / (1 + Math.pow(10, (opponentRating - rating) / 400));
+  }
+
+  // Progressive K-factor:
+  //   - sigmoid in match count: high for new scenes, decays toward 0.5× as
+  //     the scene becomes established (~18 matches is the inflection point)
+  //   - additional taper above rating 60 to dampen top-of-ladder churn
+  //   - per-mode caps and multipliers
+  function progressiveKFactor(rating, matchCount, mode) {
+    const n = matchCount || 0;
+    const experience = 0.5 + 0.5 / (1 + Math.exp((n - 18) / 6));
+    let k = 32 * experience;
+    if (rating > 60) {
+      k *= Math.max(0.5, 1 - (rating - 60) / 70);
+    }
+    if (mode === "champion") {
+      return Math.min(35, Math.max(6, Math.round(k * 0.85)));
+    }
+    if (mode === "gauntlet") {
+      return Math.min(45, Math.max(8, Math.round(k * 1.1)));
+    }
+    return Math.min(40, Math.max(6, Math.round(k)));
+  }
+
+  // Bonus multiplier for the winner when they were rated lower than the loser.
+  function underdogMultiplier(winnerRating, loserRating) {
+    const gap = loserRating - winnerRating;
+    if (gap > 30) return 1.5;
+    if (gap > 20) return 1.3;
+    if (gap > 10) return 1.1;
+    return 1.0;
+  }
+
+  // Loss-protection multiplier: when an underdog loses to a much higher-rated
+  // opponent, scale their loss down. (gap is loserRating below winnerRating)
+  function challengeProtection(loserRating, winnerRating) {
+    const gap = winnerRating - loserRating;
+    if (gap > 30) return 0.7;
+    if (gap > 25) return 0.8;
+    if (gap > 20) return 0.85;
+    if (gap > 15) return 0.9;
+    return 1.0;
+  }
+
+  // Compute rating deltas for a single match.
+  // Returns { winnerGain, loserLoss } already rounded to non-negative ints.
+  function calculateMatchOutcome(opts) {
+    const winnerRating = opts.winnerRating;
+    const loserRating = opts.loserRating;
+    const mode = opts.mode || "swiss";
+    const winnerStats = opts.winnerStats || emptyBattleStats();
+    const loserStats = opts.loserStats || emptyBattleStats();
+
+    const exp = expectedScore(winnerRating, loserRating);
+    const winnerK = progressiveKFactor(winnerRating, winnerStats.total_matches, mode);
+    const loserK = progressiveKFactor(loserRating, loserStats.total_matches, mode);
+    const underdogMult = underdogMultiplier(winnerRating, loserRating);
+    const protectionMult = challengeProtection(loserRating, winnerRating);
+
+    let winnerGain = Math.round(winnerK * (1 - exp) * underdogMult);
+    let loserLoss = Math.round(loserK * exp * protectionMult);
+
+    // Streak dampening — discourage runaway champions
+    if (mode === "gauntlet") {
+      const streak = winnerStats.current_streak || 0;
+      if (streak >= 3) {
+        const dampener = Math.max(0.3, 1 - (streak - 3) * 0.15);
+        winnerGain = Math.ceil(winnerGain * dampener);
+      }
+    }
+    if (mode === "champion") {
+      const streak = winnerStats.current_streak || 0;
+      if (streak >= 10) winnerGain = Math.ceil(winnerGain * 0.4);
+      else if (streak >= 5) winnerGain = Math.ceil(winnerGain * 0.7);
+    }
+
+    // Top-of-ladder compression — slow gains as rating climbs
+    if (winnerRating >= 85) winnerGain = Math.ceil(winnerGain * 0.6);
+    else if (winnerRating >= 70) winnerGain = Math.ceil(winnerGain * 0.8);
+
+    // Big-upset scaling: when a much lower-rated scene wins, both deltas
+    // shrink proportionally, and loser is capped at a small loss
+    if (winnerRating < loserRating - 20) {
+      const gap = loserRating - winnerRating;
+      const scale = Math.max(0.3, 1 - (gap - 20) / 100);
+      winnerGain = Math.ceil(winnerGain * scale);
+      loserLoss = Math.min(Math.ceil(loserLoss * scale), 5);
+    }
+
+    // Big-favorite mitigation: a heavy favorite winning shouldn't crush the
+    // underdog further; cap the loser's loss when gap is large
+    if (loserRating < winnerRating - 15) {
+      const gap = winnerRating - loserRating;
+      const mitigation = Math.max(0.2, 1 - gap / 45);
+      loserLoss = Math.ceil(loserLoss * mitigation);
+      if (gap > 25) loserLoss = Math.min(loserLoss, 3);
+    }
+
+    return {
+      winnerGain: Math.max(1, winnerGain),
+      loserLoss: Math.max(0, loserLoss)
+    };
+  }
+
+  // Compute and persist a Swiss/Gauntlet/Champion match result.
+  // Reads stats from the scene objects' custom_fields, applies the modifier
+  // stack, and writes back the new rating + updated stats + appended record.
+  // In Gauntlet's "falling" placement step, only the participating side's
+  // rating is touched here; the placement quirk is handled by the caller.
+  function handleComparison(winnerScene, loserScene) {
+    const winnerId = winnerScene.id;
+    const loserId = loserScene.id;
+    const winnerRating = winnerScene.rating100 || 1;
+    const loserRating = loserScene.rating100 || 1;
+    const winnerStats = parseBattleStats(winnerScene);
+    const loserStats = parseBattleStats(loserScene);
+    const winnerRecord = parseBattleRecord(winnerScene);
+    const loserRecord = parseBattleRecord(loserScene);
+
+    let winnerGain = 0, loserLoss = 0;
+
+    console.log(`[Stash Battle] 📊 Match: mode=${currentMode} winner=${winnerId}(r=${winnerRating}, n=${winnerStats.total_matches}) loser=${loserId}(r=${loserRating}, n=${loserStats.total_matches})`);
+
+    // In gauntlet/champion modes, only the participants whose run is active
+    // get their ratings adjusted; an opponent drawn from the pool is a passive
+    // matchup-source and its rating is preserved (mirrors prior behaviour).
+    let scoreWinner = true;
+    let scoreLoser = true;
     if (currentMode === "gauntlet" || currentMode === "champion") {
       const isChampionWinner = gauntletChampion && winnerId === gauntletChampion.id;
       const isFallingWinner = gauntletFalling && gauntletFallingScene && winnerId === gauntletFallingScene.id;
       const isChampionLoser = gauntletChampion && loserId === gauntletChampion.id;
       const isFallingLoser = gauntletFalling && gauntletFallingScene && loserId === gauntletFallingScene.id;
-      
-      console.log(`[Stash Battle] 📊 Roles: championId=${gauntletChampion?.id} fallingId=${gauntletFallingScene?.id} isChampionWinner=${isChampionWinner} isFallingWinner=${isFallingWinner} isChampionLoser=${isChampionLoser} isFallingLoser=${isFallingLoser}`);
-
-      if (isChampionWinner || isFallingWinner) {
-        const kFactor = getKFactor(winnerPlayCount);
-        winnerGain = Math.max(1, Math.round(kFactor * (1 - expectedWinner)));
-        console.log(`[Stash Battle] 📊 Winner gain: K=${kFactor} raw=${(kFactor * (1 - expectedWinner)).toFixed(2)} gain=${winnerGain}`);
-      }
-      if (isFallingLoser) {
-        const kFactor = getKFactor(loserPlayCount);
-        loserLoss = Math.max(1, Math.round(kFactor * expectedWinner));
-        console.log(`[Stash Battle] 📊 Falling loser loss: K=${kFactor} raw=${(kFactor * expectedWinner).toFixed(2)} loss=${loserLoss}`);
-      }
-      
-      if (loserRank === 1 && !isChampionLoser && !isFallingLoser) {
-        loserLoss = 1;
-        console.log(`[Stash Battle] 📊 Rank #1 dethrone: loserLoss forced to 1`);
-      }
-    } else {
-      const winnerK = getKFactor(winnerPlayCount);
-      const loserK = getKFactor(loserPlayCount);
-      
-      winnerGain = Math.max(1, Math.round(winnerK * (1 - expectedWinner)));
-      loserLoss = Math.max(1, Math.round(loserK * expectedWinner));
-      console.log(`[Stash Battle] 📊 Swiss ELO: winnerK=${winnerK} loserK=${loserK} winnerGain=${winnerGain} loserLoss=${loserLoss}`);
+      scoreWinner = isChampionWinner || isFallingWinner;
+      scoreLoser = isChampionLoser || isFallingLoser;
     }
-    
+
+    const outcome = calculateMatchOutcome({
+      winnerRating, loserRating, mode: currentMode, winnerStats, loserStats
+    });
+    if (scoreWinner) winnerGain = outcome.winnerGain;
+    if (scoreLoser) loserLoss = outcome.loserLoss;
+
     const newWinnerRating = Math.min(100, Math.max(1, winnerRating + winnerGain));
     const newLoserRating = Math.min(100, Math.max(1, loserRating - loserLoss));
-    
     const winnerChange = newWinnerRating - winnerRating;
     const loserChange = newLoserRating - loserRating;
-    
-    console.log(`[Stash Battle] 📊 ELO Result: winner ${winnerRating}→${newWinnerRating} (${winnerChange >= 0 ? '+' : ''}${winnerChange}) loser ${loserRating}→${newLoserRating} (${loserChange >= 0 ? '+' : ''}${loserChange})`);
 
-    if (winnerChange !== 0) updateSceneRating(winnerId, newWinnerRating);
-    if (loserChange !== 0) updateSceneRating(loserId, newLoserRating);
-    
+    console.log(`[Stash Battle] 📊 Result: winner ${winnerRating}→${newWinnerRating} (${winnerChange >= 0 ? '+' : ''}${winnerChange}) loser ${loserRating}→${newLoserRating} (${loserChange >= 0 ? '+' : ''}${loserChange})`);
+
+    // Always log the match in stats/record for both sides, even if the rating
+    // didn't move (so K-factor calibration progresses).
+    const newWinnerStats = nextBattleStats(winnerStats, true);
+    const newLoserStats = nextBattleStats(loserStats, false);
+    const newWinnerRecord = nextBattleRecord(winnerRecord, loserId, loserScene.title, true, newWinnerRating);
+    const newLoserRecord = nextBattleRecord(loserRecord, winnerId, winnerScene.title, false, newLoserRating);
+
+    updateSceneAfterMatch(winnerId, newWinnerRating, newWinnerStats, newWinnerRecord);
+    updateSceneAfterMatch(loserId, newLoserRating, newLoserStats, newLoserRecord);
+
     return { newWinnerRating, newLoserRating, winnerChange, loserChange };
   }
   
@@ -2009,9 +2206,6 @@
     const loserDisplayRating = loserScene.rating100 || 0;
     const loserSide = winnerId === currentPair.left.id ? "right" : "left";
     const loserCard = document.querySelector(`.pwr-scene-card[data-side="${loserSide}"]`);
-    
-    // Get the loser's rank for #1 dethrone logic
-    const loserRank = loserId === currentPair.left.id ? currentRanks.left : currentRanks.right;
 
     // Handle gauntlet mode (champion tracking)
     if (currentMode === "gauntlet") {
@@ -2062,10 +2256,9 @@
         gauntletChampion = currentPair.left;
       }
 
-      // Normal climbing - calculate rating changes (pass loserRank for #1 dethrone)
+      // Normal climbing - calculate rating changes
       const { newWinnerRating, newLoserRating, winnerChange, loserChange } = handleComparison(
-        winnerId, loserId, winnerRating, loserRating,
-        winnerScene.play_count, loserScene.play_count, loserRank
+        winnerScene, loserScene
       );
       
       if (winnerId === gauntletChampion.id) {
@@ -2118,10 +2311,9 @@
         gauntletChampion = currentPair.left;
       }
 
-      // Calculate rating changes (pass loserRank for #1 dethrone)
+      // Calculate rating changes
       const { newWinnerRating, newLoserRating, winnerChange, loserChange } = handleComparison(
-        winnerId, loserId, winnerRating, loserRating,
-        winnerScene.play_count, loserScene.play_count, loserRank
+        winnerScene, loserScene
       );
       
       if (winnerId === gauntletChampion.id) {
@@ -2158,8 +2350,7 @@
 
     // For Swiss: Calculate and show rating changes
     const { newWinnerRating, newLoserRating, winnerChange, loserChange } = handleComparison(
-      winnerId, loserId, winnerRating, loserRating,
-      winnerScene.play_count, loserScene.play_count
+      winnerScene, loserScene
     );
     
     // Remove both scenes from filtered pool (they've been processed)
