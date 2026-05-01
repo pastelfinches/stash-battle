@@ -30,12 +30,26 @@
     if (stored !== null) filterOpponents = stored === "1";
   } catch (e) { /* ignore */ }
 
-  // toggle: mute hover preview audio (default: unmuted to match prior behavior)
-  let mutePreviews = false;
-  try {
-    const storedMute = localStorage.getItem("pwr_mutePreviews");
-    if (storedMute !== null) mutePreviews = storedMute === "1";
-  } catch (e) { /* ignore */ }
+  // Hover-preview audio mirrors Stash's own Interface > "Sound on preview"
+  // setting. Fetched once per session at modal-open and cached. Default to
+  // muted until we know — playing muted is always permitted by autoplay
+  // policy; turning audio on without permission is not.
+  let soundOnPreview = false;
+  let soundOnPreviewLoaded = false;
+
+  async function loadSoundOnPreviewSetting() {
+    if (soundOnPreviewLoaded) return;
+    try {
+      const data = await graphqlQuery(
+        `query { configuration { interface { soundOnPreview } } }`
+      );
+      soundOnPreview = !!(data && data.configuration && data.configuration.interface && data.configuration.interface.soundOnPreview);
+      soundOnPreviewLoaded = true;
+      console.log(`[Stash Battle] 🔊 soundOnPreview from Stash config: ${soundOnPreview}`);
+    } catch (e) {
+      console.warn("[Stash Battle] Failed to load soundOnPreview setting; defaulting to muted", e);
+    }
+  }
 
   function resetGauntletState() {
     gauntletChampion = null;
@@ -1940,10 +1954,6 @@
               <input type="checkbox" id="pwr-filter-opponents-checkbox" ${filterOpponents ? "checked" : ""}>
                Use filtered scenes for both sides
             </label>
-            <label style="margin-left:16px;">
-              <input type="checkbox" id="pwr-mute-previews-checkbox" ${mutePreviews ? "checked" : ""}>
-               Mute hover previews
-            </label>
           </div>
         </div>
 
@@ -2022,35 +2032,29 @@
 
     // Touch-only devices block unmuted autoplay (the synthesized mouseenter
     // from a touch is not a "user activation" for audio). Force mute on
-    // those so previews actually play; the mute toggle still applies on
-    // hover-capable devices.
+    // those so previews actually play; on hover-capable devices respect the
+    // user's Stash "Sound on preview" setting.
     const isTouchOnly = !window.matchMedia || !window.matchMedia("(hover: hover)").matches;
+    const effectiveMuted = () => isTouchOnly || !soundOnPreview;
 
-    // Attach hover preview to entire card
+    // Per-card desktop hover. The `paused` guard makes mouseenter a no-op
+    // when the touch handler already started this preview (iOS synthesizes
+    // mouseenter after a tap and we don't want it to restart from frame 0).
     comparisonArea.querySelectorAll(".pwr-scene-card").forEach((card) => {
       const video = card.querySelector(".pwr-hover-preview");
       if (!video) return;
 
-      const startPreview = () => {
+      card.addEventListener("mouseenter", () => {
+        if (!video.paused) return;
         video.currentTime = 0;
-        video.muted = mutePreviews || isTouchOnly;
+        video.muted = effectiveMuted();
         video.volume = 0.5;
         video.play().catch(() => {});
-      };
-      const stopPreview = () => {
+      });
+      card.addEventListener("mouseleave", () => {
         video.pause();
         video.currentTime = 0;
-      };
-
-      card.addEventListener("mouseenter", startPreview);
-      card.addEventListener("mouseleave", stopPreview);
-
-      // Mobile: explicit touch handlers so a tap-and-hold (not just a synthesized
-      // mouseenter from scroll) reliably triggers playback. touchend / scroll
-      // gesture cancels.
-      card.addEventListener("touchstart", startPreview, { passive: true });
-      card.addEventListener("touchend", stopPreview, { passive: true });
-      card.addEventListener("touchcancel", stopPreview, { passive: true });
+      });
     });
     
     // Update skip button state
@@ -2510,7 +2514,11 @@
 
   function openRankingModal() {
     console.log("[Stash Battle] 🎯 Opening modal...");
-    
+
+    // Pull Stash's "Sound on preview" setting once per session so previews
+    // mirror the user's global Stash preference.
+    loadSoundOnPreviewSetting();
+
     // Pause all media playing in stash when battle modal is opened to prevent audio overlap with hover previews
     document.querySelectorAll('video, audio').forEach(v => v.pause());
     
@@ -2592,6 +2600,33 @@
       modalContent.focus();
     }
 
+    // Mobile preview behaviour, mirroring Stash's main scenes view:
+    //   - tap a card → that card's preview plays (looping)
+    //   - lift finger → preview keeps looping
+    //   - tap elsewhere in the modal (or another card) → previous preview
+    //     stops; if the new tap was on a card, that one starts
+    // Delegated to .pwr-modal-content so it survives loadNewPair re-renders.
+    let activeTouchPreview = null;
+    if (modalContent) {
+      modalContent.addEventListener("touchstart", (e) => {
+        const card = e.target.closest(".pwr-scene-card");
+        const newVideo = card ? card.querySelector(".pwr-hover-preview") : null;
+
+        if (activeTouchPreview && activeTouchPreview !== newVideo) {
+          activeTouchPreview.pause();
+          activeTouchPreview.currentTime = 0;
+          activeTouchPreview = null;
+        }
+        if (newVideo && newVideo !== activeTouchPreview) {
+          newVideo.currentTime = 0;
+          newVideo.muted = !soundOnPreview || (window.matchMedia && !window.matchMedia("(hover: hover)").matches);
+          newVideo.volume = 0.5;
+          newVideo.play().catch(() => {});
+          activeTouchPreview = newVideo;
+        }
+      }, { passive: true });
+    }
+
     // Mode toggle buttons
     modal.querySelectorAll(".pwr-mode-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -2634,21 +2669,6 @@
         }
         saveState();
         loadNewPair();
-      });
-    }
-
-    // Mute hover previews checkbox
-    const muteCheckbox = modal.querySelector("#pwr-mute-previews-checkbox");
-    if (muteCheckbox) {
-      muteCheckbox.addEventListener("change", (e) => {
-        mutePreviews = e.target.checked;
-        try {
-          localStorage.setItem("pwr_mutePreviews", mutePreviews ? "1" : "0");
-        } catch {}
-        // apply immediately to any preview videos currently rendered
-        document.querySelectorAll(".pwr-hover-preview").forEach((v) => {
-          v.muted = mutePreviews;
-        });
       });
     }
 
