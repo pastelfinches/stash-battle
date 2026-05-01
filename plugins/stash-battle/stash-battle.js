@@ -30,6 +30,14 @@
     if (stored !== null) filterOpponents = stored === "1";
   } catch (e) { /* ignore */ }
 
+  // toggle: restrict matchmaking to scenes that have not yet been rated.
+  // Falls back to the full pool if every (filtered) scene is already rated.
+  let onlyUnrated = false;
+  try {
+    const stored = localStorage.getItem("pwr_onlyUnrated");
+    if (stored !== null) onlyUnrated = stored === "1";
+  } catch (e) { /* ignore */ }
+
   // Hover-preview audio mirrors Stash's own Interface > "Sound on preview"
   // setting. Fetched once per session at modal-open and cached. Default to
   // muted until we know — playing muted is always permitted by autoplay
@@ -1054,7 +1062,10 @@
       allScenes = allResult.scenes || [];
       filteredScenes = allScenes;
     }
-    
+
+    filteredScenes = applyUnratedFilter(filteredScenes);
+    allScenes = applyUnratedFilter(allScenes);
+
     // Need at least 2 scenes in full collection for opponents
     if (allScenes.length < 2) {
       throw new Error("Not enough scenes for comparison.");
@@ -1187,10 +1198,10 @@
     // Get ALL scenes for opponent pool and ranking - CACHED
     console.log("[Stash Battle] 📋 Fetching all scenes for gauntlet...");
     const allResult = await getAllScenesCached();
-    const allScenes = allResult.scenes || [];
+    let allScenes = applyUnratedFilter(allResult.scenes || []);
     // compute filtered list once (used for left side and, optionally, for opponents)
     let filteredScenes = hasFilter
-      ? (await getFilteredScenesCached(searchParams, sceneFilter)).scenes || []
+      ? applyUnratedFilter((await getFilteredScenesCached(searchParams, sceneFilter)).scenes || [])
       : allScenes;
 
     // Build the opponent pool. Includes unrated scenes (slotted at the
@@ -1339,10 +1350,10 @@
     // Get ALL scenes for opponent pool and ranking - CACHED
     console.log("[Stash Battle] 📋 Fetching all scenes for champion...");
     const allResult = await getAllScenesCached();
-    const allScenes = allResult.scenes || [];
+    let allScenes = applyUnratedFilter(allResult.scenes || []);
     // precompute filtered list and opponent/rank pools
     let filteredScenes = hasFilter
-      ? (await getFilteredScenesCached(searchParams, sceneFilter)).scenes || []
+      ? applyUnratedFilter((await getFilteredScenesCached(searchParams, sceneFilter)).scenes || [])
       : allScenes;
     // Build the opponent pool. Includes unrated scenes (slotted at the
     // middle by implicit rating 50) so we don't endlessly recycle the
@@ -1591,6 +1602,15 @@
     return scenes.slice().sort((a, b) => effectiveRating(b) - effectiveRating(a));
   }
 
+  // Apply the "Battle unrated scenes only" toggle to a list. Returns the
+  // unrated subset, or the original list if everything is already rated
+  // (so the toggle is a soft preference, not a hard wall).
+  function applyUnratedFilter(scenes) {
+    if (!onlyUnrated) return scenes;
+    const unrated = scenes.filter(s => s.rating100 == null);
+    return unrated.length > 0 ? unrated : scenes;
+  }
+
   function emptyBattleStats() {
     return {
       total_matches: 0,
@@ -1814,8 +1834,28 @@
     if (scoreWinner) winnerGain = outcome.winnerGain;
     if (scoreLoser) loserLoss = outcome.loserLoss;
 
-    const newWinnerRating = Math.min(100, Math.max(1, winnerRating + winnerGain));
-    const newLoserRating = Math.min(100, Math.max(1, loserRating - loserLoss));
+    // Apply rating changes with cap-redistribution. Without this, two scenes
+    // both at the same boundary (e.g. both 100, both 1) produce zero net
+    // movement: winner+gain capped at 100, loser-loss capped at 1. The
+    // scenes then never differentiate and modes that depend on rank
+    // progression (Champion, Gauntlet) effectively stall.
+    // When the winner's gain pushes past 100, the excess is converted into
+    // additional loser loss; when the loser's loss pushes below 1, the
+    // deficit is converted into additional winner gain.
+    let newWinnerRating = winnerRating + winnerGain;
+    let newLoserRating = loserRating - loserLoss;
+    if (newWinnerRating > 100) {
+      const excess = newWinnerRating - 100;
+      newWinnerRating = 100;
+      newLoserRating -= excess;
+    }
+    if (newLoserRating < 1) {
+      const deficit = 1 - newLoserRating;
+      newLoserRating = 1;
+      if (newWinnerRating < 100) newWinnerRating += deficit;
+    }
+    newWinnerRating = Math.min(100, Math.max(1, newWinnerRating));
+    newLoserRating = Math.min(100, Math.max(1, newLoserRating));
     const winnerChange = newWinnerRating - winnerRating;
     const loserChange = newLoserRating - loserRating;
 
@@ -1969,6 +2009,10 @@
             <label>
               <input type="checkbox" id="pwr-filter-opponents-checkbox" ${filterOpponents ? "checked" : ""}>
                Use filtered scenes for both sides
+            </label>
+            <label style="margin-left:16px;">
+              <input type="checkbox" id="pwr-only-unrated-checkbox" ${onlyUnrated ? "checked" : ""}>
+               Battle unrated scenes only
             </label>
           </div>
         </div>
@@ -2685,6 +2729,26 @@
           localStorage.setItem("pwr_filterOpponents", filterOpponents ? "1" : "0");
         } catch {}
         // switching the toggle counts as changing filters: reset gauntlet/champion run
+        if (currentMode === "gauntlet" || currentMode === "champion") {
+          resetGauntletState();
+        }
+        saveState();
+        loadNewPair();
+      });
+    }
+
+    // "Only unrated" checkbox
+    const unratedCheckbox = modal.querySelector("#pwr-only-unrated-checkbox");
+    if (unratedCheckbox) {
+      unratedCheckbox.addEventListener("change", (e) => {
+        onlyUnrated = e.target.checked;
+        try {
+          localStorage.setItem("pwr_onlyUnrated", onlyUnrated ? "1" : "0");
+        } catch {}
+        // pool changed; reset shuffle and any in-flight gauntlet/champion run
+        shuffledFilteredScenes = [];
+        shuffleIndex = 0;
+        shuffleFilterKey = null;
         if (currentMode === "gauntlet" || currentMode === "champion") {
           resetGauntletState();
         }
