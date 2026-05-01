@@ -1595,6 +1595,28 @@
   const IMPLICIT_RATING = 50;
   const effectiveRating = (s) => (s && s.rating100 != null ? s.rating100 : IMPLICIT_RATING);
 
+  // Six-tier classification (cutoffs match the convention popularised by the
+  // Ascension performer-rating plugin). Each tier has a designated colour for
+  // labels and a class for theming.
+  const TIER_ORDER = ["F-Tier", "D-Tier", "C-Tier", "B-Tier", "A-Tier", "S-Tier"];
+  const TIER_COLORS = {
+    "S-Tier": "#eb9834",
+    "A-Tier": "#e014aa",
+    "B-Tier": "#7f1e82",
+    "C-Tier": "#14bbe0",
+    "D-Tier": "#92e014",
+    "F-Tier": "#808080"
+  };
+  function getRatingTier(rating) {
+    if (rating >= 85) return "S-Tier";
+    if (rating >= 70) return "A-Tier";
+    if (rating >= 55) return "B-Tier";
+    if (rating >= 40) return "C-Tier";
+    if (rating >= 25) return "D-Tier";
+    return "F-Tier";
+  }
+  function getTierColor(tier) { return TIER_COLORS[tier] || "#808080"; }
+
   // Build the opponent pool: include unrated scenes (treated as rating 50
   // so neighbour-reach picks them up alongside mid-tier rated scenes), then
   // sort by effective rating descending so neighbour-reach still works.
@@ -1810,29 +1832,18 @@
     const winnerRecord = parseBattleRecord(winnerScene);
     const loserRecord = parseBattleRecord(loserScene);
 
-    let winnerGain = 0, loserLoss = 0;
-
     console.log(`[Stash Battle] 📊 Match: mode=${currentMode} winner=${winnerId}(r=${winnerRating}, n=${winnerStats.total_matches}) loser=${loserId}(r=${loserRating}, n=${loserStats.total_matches})`);
 
-    // In gauntlet/champion modes, only the participants whose run is active
-    // get their ratings adjusted; an opponent drawn from the pool is a passive
-    // matchup-source and its rating is preserved (mirrors prior behaviour).
-    let scoreWinner = true;
-    let scoreLoser = true;
-    if (currentMode === "gauntlet" || currentMode === "champion") {
-      const isChampionWinner = gauntletChampion && winnerId === gauntletChampion.id;
-      const isFallingWinner = gauntletFalling && gauntletFallingScene && winnerId === gauntletFallingScene.id;
-      const isChampionLoser = gauntletChampion && loserId === gauntletChampion.id;
-      const isFallingLoser = gauntletFalling && gauntletFallingScene && loserId === gauntletFallingScene.id;
-      scoreWinner = isChampionWinner || isFallingWinner;
-      scoreLoser = isChampionLoser || isFallingLoser;
-    }
-
+    // Score both sides on every match. Earlier versions exempted "passive
+    // opponents" in Gauntlet/Champion runs — but that left their ratings
+    // and stats frozen, so they kept reappearing as ladder rungs whose
+    // ratings drifted out of sync with reality. Real Elo touches both
+    // sides every time.
     const outcome = calculateMatchOutcome({
       winnerRating, loserRating, mode: currentMode, winnerStats, loserStats
     });
-    if (scoreWinner) winnerGain = outcome.winnerGain;
-    if (scoreLoser) loserLoss = outcome.loserLoss;
+    let winnerGain = outcome.winnerGain;
+    let loserLoss = outcome.loserLoss;
 
     // Apply rating changes with cap-redistribution. Without this, two scenes
     // both at the same boundary (e.g. both 100, both 1) produce zero net
@@ -1918,7 +1929,14 @@
     
     const screenshotPath = scene.paths ? scene.paths.screenshot : null;
     const previewPath = scene.paths ? scene.paths.preview : null;
-    const stashRating = scene.rating100 ? `${scene.rating100}/100` : "Unrated";
+    let stashRating;
+    if (scene.rating100 != null) {
+      const tier = getRatingTier(scene.rating100);
+      const tierColor = getTierColor(tier);
+      stashRating = `<span style="color:${tierColor}; font-weight:bold">${tier}</span> | ${scene.rating100}/100`;
+    } else {
+      stashRating = "Unrated";
+    }
     
     // Handle numeric ranks and string ranks
     let rankDisplay = '';
@@ -2307,37 +2325,55 @@
         console.log(`[Stash Battle] 📊 Falling mode: fallingScene=${gauntletFallingScene.id} winnerId=${winnerId} loserId=${loserId} loserRating=${loserRating}`);
         if (winnerId === gauntletFallingScene.id) {
           // Falling scene won - found their floor!
-          // Set their rating to just above the scene they beat
+          // 1. Run normal Elo so the opponent's rating + stats update too
+          //    (and the falling scene's stats are recorded).
+          const { newLoserRating, loserChange } = handleComparison(winnerScene, loserScene);
+          // 2. Override the falling scene's rating to the placement value
+          //    (just above the scene they beat). Stats already persisted.
           const finalRating = Math.min(100, loserRating + 1);
           console.log(`[Stash Battle] 📊 Falling scene found floor: loserRating=${loserRating} → finalRating=${finalRating}`);
           updateSceneRating(gauntletFallingScene.id, finalRating);
-          
+
           // Final rank is one above the opponent (we beat them, so we're above them)
           const opponentRank = loserId === currentPair.left.id ? currentRanks.left : currentRanks.right;
           const finalRank = Math.max(1, (opponentRank || 1) - 1);
-          
-          // Visual feedback
+
+          // Visual feedback with animations
           winnerCard.classList.add("pwr-winner");
           if (loserCard) loserCard.classList.add("pwr-loser");
-          
-          // Show placement screen after brief delay
+          showRatingAnimation(winnerCard, winnerRating, finalRating, finalRating - winnerRating, true);
+          if (loserCard) {
+            const loserDisplayNew = loserChange !== 0 ? newLoserRating : loserDisplayRating;
+            showRatingAnimation(loserCard, loserDisplayRating, loserDisplayNew, loserChange, false);
+          }
+
+          // Show placement screen after animation
           setTimeout(() => {
             showPlacementScreen(gauntletFallingScene, finalRank, finalRating);
             saveState();
-          }, 800);
+          }, 1500);
           return;
         } else {
-          // Falling scene lost again - keep falling
+          // Falling scene lost again - keep falling. Apply Elo to both
+          // sides so the opponent that just won gains rating + stats and
+          // the falling scene's losses accumulate.
+          const { newWinnerRating, newLoserRating, winnerChange, loserChange } =
+            handleComparison(winnerScene, loserScene);
           gauntletDefeated.push(winnerId);
           saveState();
-          
-          // Visual feedback
+
+          // Visual feedback with animations
           winnerCard.classList.add("pwr-winner");
           if (loserCard) loserCard.classList.add("pwr-loser");
-          
+          showRatingAnimation(winnerCard, winnerRating, newWinnerRating, winnerChange, true);
+          if (loserCard) {
+            const loserDisplayNew = loserChange !== 0 ? newLoserRating : loserDisplayRating;
+            showRatingAnimation(loserCard, loserDisplayRating, loserDisplayNew, loserChange, false);
+          }
+
           setTimeout(() => {
             loadNewPair();
-          }, 800);
+          }, 1500);
           return;
         }
       }
@@ -2470,6 +2506,10 @@
   }
 
   function showRatingAnimation(card, oldRating, newRating, change, isWinner) {
+    // Tier-change notification fires alongside the rating animation when a
+    // match crosses a tier boundary.
+    showTierChangeNotification(card, oldRating, newRating);
+
     // Create overlay
     const overlay = document.createElement("div");
     overlay.className = `pwr-rating-overlay ${isWinner ? 'pwr-rating-winner' : 'pwr-rating-loser'}`;
@@ -2507,6 +2547,52 @@
     setTimeout(() => {
       overlay.remove();
     }, 1400);
+  }
+
+  // Floats a "Tier Change: ⬆/⬇ <Tier>" pill above the card when a match
+  // moves the rating across a tier boundary. No-op when the tier is
+  // unchanged.
+  function showTierChangeNotification(card, oldRating, newRating) {
+    const oldTier = getRatingTier(oldRating);
+    const newTier = getRatingTier(newRating);
+    if (oldTier === newTier) return;
+
+    const upgrade = TIER_ORDER.indexOf(newTier) > TIER_ORDER.indexOf(oldTier);
+    const arrow = upgrade ? "⬆️" : "⬇️";
+    const color = getTierColor(newTier);
+
+    const note = document.createElement("div");
+    note.className = "pwr-tier-change-notification";
+    note.innerHTML = `Tier Change: ${arrow} <span style="color:${color}">${newTier}</span>`;
+    Object.assign(note.style, {
+      position: "absolute",
+      top: "8px",
+      left: "50%",
+      transform: `translateX(-50%) translateY(${upgrade ? "20px" : "-20px"})`,
+      fontSize: "1.5rem",
+      fontWeight: "bold",
+      textAlign: "center",
+      zIndex: "150",
+      pointerEvents: "none",
+      whiteSpace: "nowrap",
+      opacity: "0",
+      textShadow: "0 1px 4px rgba(0,0,0,0.7)",
+      transition: "opacity 0.3s ease, transform 0.5s cubic-bezier(0.25, 0.46, 0.45, 0.94)"
+    });
+    if (getComputedStyle(card).position === "static") card.style.position = "relative";
+    card.appendChild(note);
+
+    // ease in
+    setTimeout(() => {
+      note.style.opacity = "1";
+      note.style.transform = "translateX(-50%) translateY(0)";
+    }, 10);
+    // ease out
+    setTimeout(() => {
+      note.style.opacity = "0";
+      note.style.transform = `translateX(-50%) translateY(${upgrade ? "-20px" : "20px"})`;
+      setTimeout(() => { if (note.parentNode) note.remove(); }, 300);
+    }, 1700);
   }
 
   // ============================================
