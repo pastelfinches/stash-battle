@@ -1096,14 +1096,14 @@
       }
     }
     
-    // decide which list to draw opponents from; ranking numbers come from same list
-    // Right side should only show rated scenes unless filter applies to both sides
+    // Build the opponent pool. Includes unrated scenes (slotted at the
+    // middle by implicit rating 50) so the right side has full library
+    // variety, not just the small set of already-rated scenes.
     let opponentPool;
     if (filterOpponents && hasFilter) {
-      opponentPool = filteredScenes;
+      opponentPool = buildOpponentPool(filteredScenes);
     } else {
-      const ratedOnly = allScenes.filter(s => s.rating100 != null);
-      opponentPool = ratedOnly.length >= 1 ? ratedOnly : allScenes;
+      opponentPool = buildOpponentPool(allScenes);
     }
 
     // If filtered opponent pool is too small, restart the cycle (clear removals, refresh cache)
@@ -1193,14 +1193,14 @@
       ? (await getFilteredScenesCached(searchParams, sceneFilter)).scenes || []
       : allScenes;
 
-    // choose pool for opponents / ranking; use filtered list when flag is on and a filter exists
-    // Right side should only show rated scenes unless filter applies to both sides
+    // Build the opponent pool. Includes unrated scenes (slotted at the
+    // middle by implicit rating 50) so we don't endlessly recycle the
+    // small set of already-rated scenes.
     let opponentPool;
     if (filterOpponents && hasFilter) {
-      opponentPool = filteredScenes;
+      opponentPool = buildOpponentPool(filteredScenes);
     } else {
-      const ratedOnly = allScenes.filter(s => s.rating100 != null);
-      opponentPool = ratedOnly.length >= 1 ? ratedOnly : allScenes;
+      opponentPool = buildOpponentPool(allScenes);
     }
     totalScenesCount = opponentPool.length;
 
@@ -1344,13 +1344,14 @@
     let filteredScenes = hasFilter
       ? (await getFilteredScenesCached(searchParams, sceneFilter)).scenes || []
       : allScenes;
-    // Right side should only show rated scenes unless filter applies to both sides
+    // Build the opponent pool. Includes unrated scenes (slotted at the
+    // middle by implicit rating 50) so we don't endlessly recycle the
+    // small set of already-rated scenes.
     let opponentPool;
     if (filterOpponents && hasFilter) {
-      opponentPool = filteredScenes;
+      opponentPool = buildOpponentPool(filteredScenes);
     } else {
-      const ratedOnly = allScenes.filter(s => s.rating100 != null);
-      opponentPool = ratedOnly.length >= 1 ? ratedOnly : allScenes;
+      opponentPool = buildOpponentPool(allScenes);
     }
     totalScenesCount = opponentPool.length;
     
@@ -1576,6 +1577,20 @@
   const BATTLE_RECORD_FIELD = "battle_record";
   const BATTLE_RECORD_MAX = 30;
 
+  // Implicit rating for an unrated scene: use the median of the scale rather
+  // than the floor. This lets new scenes slot into the middle of the
+  // matchmaking pool instead of being trapped at the bottom, and gives the
+  // Elo math sensible deltas on a scene's first match.
+  const IMPLICIT_RATING = 50;
+  const effectiveRating = (s) => (s && s.rating100 != null ? s.rating100 : IMPLICIT_RATING);
+
+  // Build the opponent pool: include unrated scenes (treated as rating 50
+  // so neighbour-reach picks them up alongside mid-tier rated scenes), then
+  // sort by effective rating descending so neighbour-reach still works.
+  function buildOpponentPool(scenes) {
+    return scenes.slice().sort((a, b) => effectiveRating(b) - effectiveRating(a));
+  }
+
   function emptyBattleStats() {
     return {
       total_matches: 0,
@@ -1768,8 +1783,8 @@
   function handleComparison(winnerScene, loserScene) {
     const winnerId = winnerScene.id;
     const loserId = loserScene.id;
-    const winnerRating = winnerScene.rating100 || 1;
-    const loserRating = loserScene.rating100 || 1;
+    const winnerRating = effectiveRating(winnerScene);
+    const loserRating = effectiveRating(loserScene);
     const winnerStats = parseBattleStats(winnerScene);
     const loserStats = parseBattleStats(loserScene);
     const winnerRecord = parseBattleRecord(winnerScene);
@@ -2234,8 +2249,8 @@
     
     const winnerScene = winnerId === currentPair.left.id ? currentPair.left : currentPair.right;
     const loserScene = loserId === currentPair.left.id ? currentPair.left : currentPair.right;
-    const winnerRating = winnerScene.rating100 || 1;
-    const loserRating = loserScene.rating100 || 1;
+    const winnerRating = effectiveRating(winnerScene);
+    const loserRating = effectiveRating(loserScene);
     const loserDisplayRating = loserScene.rating100 || 0;
     const loserSide = winnerId === currentPair.left.id ? "right" : "left";
     const loserCard = document.querySelector(`.pwr-scene-card[data-side="${loserSide}"]`);
