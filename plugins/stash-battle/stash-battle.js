@@ -1880,7 +1880,7 @@
             ? `<img class="pwr-scene-image" src="${screenshotPath}" alt="${title}" loading="lazy" />`
             : `<div class="pwr-scene-image pwr-no-image">No Screenshot</div>`
           }
-          ${previewPath ? `<video class="pwr-hover-preview" src="${previewPath}" loop playsinline></video>` : ''}
+          ${previewPath ? `<video class="pwr-hover-preview" src="${previewPath}" loop playsinline muted></video>` : ''}
           <div class="pwr-scene-duration">${formatDuration(duration)}</div>
           ${streakDisplay}
           <div class="pwr-click-hint">Click to open scene</div>
@@ -2020,22 +2020,37 @@
       });
     });
 
+    // Touch-only devices block unmuted autoplay (the synthesized mouseenter
+    // from a touch is not a "user activation" for audio). Force mute on
+    // those so previews actually play; the mute toggle still applies on
+    // hover-capable devices.
+    const isTouchOnly = !window.matchMedia || !window.matchMedia("(hover: hover)").matches;
+
     // Attach hover preview to entire card
     comparisonArea.querySelectorAll(".pwr-scene-card").forEach((card) => {
       const video = card.querySelector(".pwr-hover-preview");
       if (!video) return;
-      
-      card.addEventListener("mouseenter", () => {
+
+      const startPreview = () => {
         video.currentTime = 0;
-        video.muted = mutePreviews;
+        video.muted = mutePreviews || isTouchOnly;
         video.volume = 0.5;
         video.play().catch(() => {});
-      });
-      
-      card.addEventListener("mouseleave", () => {
+      };
+      const stopPreview = () => {
         video.pause();
         video.currentTime = 0;
-      });
+      };
+
+      card.addEventListener("mouseenter", startPreview);
+      card.addEventListener("mouseleave", stopPreview);
+
+      // Mobile: explicit touch handlers so a tap-and-hold (not just a synthesized
+      // mouseenter from scroll) reliably triggers playback. touchend / scroll
+      // gesture cancels.
+      card.addEventListener("touchstart", startPreview, { passive: true });
+      card.addEventListener("touchend", stopPreview, { passive: true });
+      card.addEventListener("touchcancel", stopPreview, { passive: true });
     });
     
     // Update skip button state
