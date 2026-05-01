@@ -257,11 +257,14 @@
   z-index: 1;
 }
 
-.pwr-scene-card:hover .pwr-hover-preview {
+/* Visibility is JS-driven (via .pwr-preview-active) rather than :hover so
+   iOS Safari's sticky-hover doesn't keep the previous preview visible
+   after the card is replaced by a new pair. */
+.pwr-scene-card.pwr-preview-active .pwr-hover-preview {
   opacity: 1;
 }
 
-.pwr-scene-card:hover .pwr-scene-image:not(.pwr-no-image) {
+.pwr-scene-card.pwr-preview-active .pwr-scene-image:not(.pwr-no-image) {
   opacity: 0;
 }
 

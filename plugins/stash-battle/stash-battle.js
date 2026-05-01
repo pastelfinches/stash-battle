@@ -1910,6 +1910,7 @@
             <div class="pwr-scene-meta">
               <div class="pwr-meta-item"><strong>Studio:</strong> ${studio}</div>
               <div class="pwr-meta-item"><strong>Performers:</strong> ${performers}</div>
+              <div class="pwr-meta-item"><strong>Date:</strong> ${scene.date || "Unknown"}</div>
               <div class="pwr-meta-item"><strong>Play Count:</strong> ${scene.play_count || 0}</div>
               <div class="pwr-meta-item"><strong>Rating:</strong> ${stashRating}</div>
               <div class="pwr-meta-item pwr-tags-row"><strong>Tags:</strong> ${tags.length > 0 ? tags.map((tag) => `<span class="pwr-tag">${tag}</span>`).join("") : '<span class="pwr-none">None</span>'}</div>
@@ -2049,9 +2050,11 @@
         video.currentTime = 0;
         video.muted = effectiveMuted();
         video.volume = 0.5;
+        card.classList.add("pwr-preview-active");
         video.play().catch(() => {});
       });
       card.addEventListener("mouseleave", () => {
+        card.classList.remove("pwr-preview-active");
         video.pause();
         video.currentTime = 0;
       });
@@ -2613,6 +2616,8 @@
         const newVideo = card ? card.querySelector(".pwr-hover-preview") : null;
 
         if (activeTouchPreview && activeTouchPreview !== newVideo) {
+          const prevCard = activeTouchPreview.closest(".pwr-scene-card");
+          if (prevCard) prevCard.classList.remove("pwr-preview-active");
           activeTouchPreview.pause();
           activeTouchPreview.currentTime = 0;
           activeTouchPreview = null;
@@ -2621,6 +2626,7 @@
           newVideo.currentTime = 0;
           newVideo.muted = !soundOnPreview || (window.matchMedia && !window.matchMedia("(hover: hover)").matches);
           newVideo.volume = 0.5;
+          card.classList.add("pwr-preview-active");
           newVideo.play().catch(() => {});
           activeTouchPreview = newVideo;
         }
